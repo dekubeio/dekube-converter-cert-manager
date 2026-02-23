@@ -16,7 +16,7 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
-from h2c import ConvertResult, Converter
+from h2c import ConverterResult, Converter
 
 
 # ---- key / cert generation ------------------------------------------------
@@ -152,7 +152,7 @@ class CertManagerConverter(Converter):
     def convert(self, kind, manifests, ctx):
         if kind in ("ClusterIssuer", "Issuer"):
             self._index_issuers(manifests)
-            return ConvertResult()
+            return ConverterResult()
         # kind == "Certificate"
         return self._process_certificates(manifests, ctx)
 
@@ -181,7 +181,7 @@ class CertManagerConverter(Converter):
                 f"Certificate '{name}' references unresolvable issuer "
                 f"'{issuer}' (ACME or missing) — skipped")
 
-        return ConvertResult()
+        return ConverterResult()
 
     @staticmethod
     def _merge_by_secret(batch):
