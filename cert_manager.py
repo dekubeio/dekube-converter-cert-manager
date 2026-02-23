@@ -16,7 +16,7 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
-from h2c import ConverterResult, Converter
+from h2c import ConverterResult, Converter  # pylint: disable=import-error  # h2c resolves at runtime
 
 
 # ---- key / cert generation ------------------------------------------------
@@ -134,7 +134,7 @@ def _pem_key(key):
 
 # ---- converter class -------------------------------------------------------
 
-class CertManagerConverter(Converter):
+class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods  # contract: one class, one method
     """Convert cert-manager Certificate/ClusterIssuer/Issuer to Secrets.
 
     Dispatch order matters: ClusterIssuer and Issuer are indexed first,
@@ -150,6 +150,7 @@ class CertManagerConverter(Converter):
         self._generated = {}   # secret_name → {"key": key_obj, "cert": cert_obj}
 
     def convert(self, kind, manifests, ctx):
+        """Dispatch to issuer indexer or certificate processor."""
         if kind in ("ClusterIssuer", "Issuer"):
             self._index_issuers(manifests)
             return ConverterResult()
