@@ -29,7 +29,7 @@ Replaces cert-manager's certificate issuance with local generation at conversion
 
 ## Priority
 
-`10` -- runs first. Generates secrets consumed by trust-manager (priority 20) and keycloak (priority 50).
+`100` -- runs early. Generates secrets consumed by trust-manager (priority 200) and keycloak (priority 500).
 
 ## Incompatibilities
 
