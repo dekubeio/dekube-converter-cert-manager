@@ -16,7 +16,7 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
-from h2c import ConverterResult, Converter  # pylint: disable=import-error  # h2c resolves at runtime
+from dekube import ConverterResult, Converter  # pylint: disable=import-error  # h2c resolves at runtime
 
 
 # ---- key / cert generation ------------------------------------------------
