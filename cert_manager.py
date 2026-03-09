@@ -40,7 +40,7 @@ def _build_subject(cert_spec):
     cn = cert_spec.get("commonName")
     if cn:
         attrs.append(x509.NameAttribute(NameOID.COMMON_NAME, cn))
-    subject = cert_spec.get("subject", {})
+    subject = cert_spec.get("subject") or {}
     for org in subject.get("organizations", []):
         attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, org))
     for ou in subject.get("organizationalUnits", []):
@@ -57,18 +57,21 @@ def _build_subject(cert_spec):
 def _parse_duration(duration_str):
     """Parse cert-manager duration (e.g. '87600h') to timedelta."""
     s = duration_str.strip()
-    if s.endswith("h"):
-        return datetime.timedelta(hours=int(s[:-1]))
-    if s.endswith("m"):
-        return datetime.timedelta(minutes=int(s[:-1]))
-    if s.endswith("s"):
-        return datetime.timedelta(seconds=int(s[:-1]))
+    try:
+        if s.endswith("h"):
+            return datetime.timedelta(hours=int(s[:-1]))
+        if s.endswith("m"):
+            return datetime.timedelta(minutes=int(s[:-1]))
+        if s.endswith("s"):
+            return datetime.timedelta(seconds=int(s[:-1]))
+    except ValueError:
+        pass
     return datetime.timedelta(hours=2160)  # 90 days default
 
 
 def _generate_cert(spec, ca_key=None, ca_cert=None):
     """Generate a certificate from a cert-manager Certificate spec."""
-    pk_spec = spec.get("privateKey", {})
+    pk_spec = spec.get("privateKey") or {}
     algorithm = pk_spec.get("algorithm", "RSA")
     default_size = 256 if algorithm.upper() == "ECDSA" else 2048
     key_size = pk_spec.get("size", default_size)
@@ -146,7 +149,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
     priority = 100  # runs first: generates secrets consumed by trust-manager & keycloak
 
     def __init__(self):
-        self._issuers = {}     # name → {"kind": str, "spec": dict}
+        self._issuers = {}     # name → issuer spec dict
         self._generated = {}   # secret_name → {"key": key_obj, "cert": cert_obj}
 
     def convert(self, kind, manifests, ctx):
