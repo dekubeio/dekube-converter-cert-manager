@@ -1,4 +1,4 @@
-"""h2c operator: cert-manager — Certificate, ClusterIssuer, Issuer.
+"""dekube converter: cert-manager — Certificate, ClusterIssuer, Issuer.
 
 Generates real PEM certificates at conversion time and injects them as
 synthetic K8s Secrets into ctx.secrets. Workloads that mount these Secrets
