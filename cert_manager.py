@@ -248,9 +248,12 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         # Write to disk — any consumer (workload mounts, Caddy, etc.) can use it
         secret_dir = os.path.join(ctx.output_dir, "secrets", secret_name)
         os.makedirs(secret_dir, exist_ok=True)
+        out_real = os.path.realpath(ctx.output_dir) + os.sep
         for file_key, file_val in string_data.items():
-            with open(os.path.join(secret_dir, file_key), "w",
-                       encoding="utf-8") as f:
+            out_path = os.path.join(secret_dir, file_key)
+            if not os.path.realpath(out_path).startswith(out_real):
+                continue
+            with open(out_path, "w", encoding="utf-8") as f:
                 f.write(file_val)
         ctx.generated_secrets.add(secret_name)
 
