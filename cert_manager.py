@@ -19,122 +19,6 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from dekube import ConverterResult, Converter  # pylint: disable=import-error  # h2c resolves at runtime
 
 
-# ---- key / cert generation ------------------------------------------------
-
-def _generate_key(algorithm="RSA", key_size=2048):
-    """Generate a private key (RSA or ECDSA)."""
-    if algorithm.upper() == "ECDSA":
-        if key_size <= 256:
-            curve = ec.SECP256R1()
-        elif key_size <= 384:
-            curve = ec.SECP384R1()
-        else:
-            curve = ec.SECP521R1()
-        return ec.generate_private_key(curve)
-    return rsa.generate_private_key(public_exponent=65537, key_size=key_size)
-
-
-def _build_subject(cert_spec):
-    """Build an x509.Name from a cert-manager Certificate spec."""
-    attrs = []
-    cn = cert_spec.get("commonName")
-    if cn:
-        attrs.append(x509.NameAttribute(NameOID.COMMON_NAME, cn))
-    subject = cert_spec.get("subject") or {}
-    for org in subject.get("organizations", []):
-        attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, org))
-    for ou in subject.get("organizationalUnits", []):
-        attrs.append(x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ou))
-    for country in subject.get("countries", []):
-        attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, country))
-    for locality in subject.get("localities", []):
-        attrs.append(x509.NameAttribute(NameOID.LOCALITY_NAME, locality))
-    if not attrs:
-        attrs.append(x509.NameAttribute(NameOID.COMMON_NAME, "h2c-generated"))
-    return x509.Name(attrs)
-
-
-def _parse_duration(duration_str):
-    """Parse cert-manager duration (e.g. '87600h') to timedelta."""
-    s = duration_str.strip()
-    try:
-        if s.endswith("h"):
-            return datetime.timedelta(hours=int(s[:-1]))
-        if s.endswith("m"):
-            return datetime.timedelta(minutes=int(s[:-1]))
-        if s.endswith("s"):
-            return datetime.timedelta(seconds=int(s[:-1]))
-    except ValueError:
-        pass
-    return datetime.timedelta(hours=2160)  # 90 days default
-
-
-def _generate_cert(spec, ca_key=None, ca_cert=None):
-    """Generate a certificate from a cert-manager Certificate spec."""
-    pk_spec = spec.get("privateKey") or {}
-    algorithm = pk_spec.get("algorithm", "RSA")
-    default_size = 256 if algorithm.upper() == "ECDSA" else 2048
-    key_size = pk_spec.get("size", default_size)
-
-    key = _generate_key(algorithm, key_size)
-    subject = _build_subject(spec)
-    duration = _parse_duration(spec.get("duration", "2160h"))
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    builder = (x509.CertificateBuilder()
-               .subject_name(subject)
-               .not_valid_before(now)
-               .not_valid_after(now + duration)
-               .serial_number(x509.random_serial_number())
-               .public_key(key.public_key()))
-
-    # Basic constraints
-    is_ca = spec.get("isCA", False)
-    builder = builder.add_extension(
-        x509.BasicConstraints(ca=is_ca, path_length=None), critical=True)
-
-    # Subject Key Identifier
-    builder = builder.add_extension(
-        x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
-        critical=False)
-
-    # SAN — dnsNames
-    dns_names = spec.get("dnsNames", [])
-    if dns_names:
-        builder = builder.add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(n) for n in dns_names]),
-            critical=False)
-
-    # Issuer
-    if ca_key and ca_cert:
-        builder = builder.issuer_name(ca_cert.subject)
-        builder = builder.add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                ca_cert.public_key()),
-            critical=False)
-        signing_key = ca_key
-    else:
-        builder = builder.issuer_name(subject)
-        signing_key = key
-
-    cert = builder.sign(signing_key, hashes.SHA256())
-    return key, cert
-
-
-def _pem_cert(cert):
-    """Serialize certificate to PEM string."""
-    return cert.public_bytes(serialization.Encoding.PEM).decode()
-
-
-def _pem_key(key):
-    """Serialize private key to PEM string (unencrypted PKCS8)."""
-    return key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    ).decode()
-
-
 # ---- converter class -------------------------------------------------------
 
 class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods  # contract: one class, one method
@@ -227,17 +111,17 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             if gen:
                 ca_key, ca_cert = gen["key"], gen["cert"]
 
-        key, cert = _generate_cert(spec, ca_key, ca_cert)
+        key, cert = self._generate_cert(spec, ca_key, ca_cert)
         self._generated[secret_name] = {"key": key, "cert": cert}
 
         string_data = {
-            "tls.crt": _pem_cert(cert),
-            "tls.key": _pem_key(key),
+            "tls.crt": self._pem_cert(cert),
+            "tls.key": self._pem_key(key),
         }
         if ca_cert:
-            string_data["ca.crt"] = _pem_cert(ca_cert)
+            string_data["ca.crt"] = self._pem_cert(ca_cert)
         elif spec.get("isCA"):
-            string_data["ca.crt"] = _pem_cert(cert)
+            string_data["ca.crt"] = self._pem_cert(cert)
 
         # Inject as K8s Secret format (stringData, not base64)
         ctx.secrets[secret_name] = {
@@ -266,6 +150,119 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         else:
             print(f"  cert-manager: generated {secret_name} "
                   f"(Certificate/{name})", file=sys.stderr)
+
+    @staticmethod
+    def _generate_key(algorithm="RSA", key_size=2048):
+        """Generate a private key (RSA or ECDSA)."""
+        if algorithm.upper() == "ECDSA":
+            if key_size <= 256:
+                curve = ec.SECP256R1()
+            elif key_size <= 384:
+                curve = ec.SECP384R1()
+            else:
+                curve = ec.SECP521R1()
+            return ec.generate_private_key(curve)
+        return rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+
+    @staticmethod
+    def _build_subject(cert_spec):
+        """Build an x509.Name from a cert-manager Certificate spec."""
+        attrs = []
+        cn = cert_spec.get("commonName")
+        if cn:
+            attrs.append(x509.NameAttribute(NameOID.COMMON_NAME, cn))
+        subject = cert_spec.get("subject") or {}
+        for org in subject.get("organizations", []):
+            attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, org))
+        for ou in subject.get("organizationalUnits", []):
+            attrs.append(x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ou))
+        for country in subject.get("countries", []):
+            attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, country))
+        for locality in subject.get("localities", []):
+            attrs.append(x509.NameAttribute(NameOID.LOCALITY_NAME, locality))
+        if not attrs:
+            attrs.append(x509.NameAttribute(NameOID.COMMON_NAME, "h2c-generated"))
+        return x509.Name(attrs)
+
+    @staticmethod
+    def _parse_duration(duration_str):
+        """Parse cert-manager duration (e.g. '87600h') to timedelta."""
+        s = duration_str.strip()
+        try:
+            if s.endswith("h"):
+                return datetime.timedelta(hours=int(s[:-1]))
+            if s.endswith("m"):
+                return datetime.timedelta(minutes=int(s[:-1]))
+            if s.endswith("s"):
+                return datetime.timedelta(seconds=int(s[:-1]))
+        except ValueError:
+            pass
+        return datetime.timedelta(hours=2160)  # 90 days default
+
+    def _generate_cert(self, spec, ca_key=None, ca_cert=None):
+        """Generate a certificate from a cert-manager Certificate spec."""
+        pk_spec = spec.get("privateKey") or {}
+        algorithm = pk_spec.get("algorithm", "RSA")
+        default_size = 256 if algorithm.upper() == "ECDSA" else 2048
+        key_size = pk_spec.get("size", default_size)
+
+        key = self._generate_key(algorithm, key_size)
+        subject = self._build_subject(spec)
+        duration = self._parse_duration(spec.get("duration", "2160h"))
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        builder = (x509.CertificateBuilder()
+                   .subject_name(subject)
+                   .not_valid_before(now)
+                   .not_valid_after(now + duration)
+                   .serial_number(x509.random_serial_number())
+                   .public_key(key.public_key()))
+
+        # Basic constraints
+        is_ca = spec.get("isCA", False)
+        builder = builder.add_extension(
+            x509.BasicConstraints(ca=is_ca, path_length=None), critical=True)
+
+        # Subject Key Identifier
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=False)
+
+        # SAN — dnsNames
+        dns_names = spec.get("dnsNames", [])
+        if dns_names:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(n) for n in dns_names]),
+                critical=False)
+
+        # Issuer
+        if ca_key and ca_cert:
+            builder = builder.issuer_name(ca_cert.subject)
+            builder = builder.add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    ca_cert.public_key()),
+                critical=False)
+            signing_key = ca_key
+        else:
+            builder = builder.issuer_name(subject)
+            signing_key = key
+
+        cert = builder.sign(signing_key, hashes.SHA256())
+        return key, cert
+
+    @staticmethod
+    def _pem_cert(cert):
+        """Serialize certificate to PEM string."""
+        return cert.public_bytes(serialization.Encoding.PEM).decode()
+
+    @staticmethod
+    def _pem_key(key):
+        """Serialize private key to PEM string (unencrypted PKCS8)."""
+        return key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode()
 
     def _resolve_batch(self, certs):
         """One pass: split certs into resolvable now vs still pending."""
