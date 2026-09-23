@@ -9,6 +9,7 @@ Requires: cryptography
 
 import datetime
 import os
+import re
 import sys
 
 from cryptography import x509
@@ -18,6 +19,11 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from dekube import ConverterResult, Converter  # pylint: disable=import-error  # h2c resolves at runtime
 
+
+# Go time.ParseDuration units (cert-manager duration/renewBefore format)
+_GO_DURATION_RE = re.compile(r'(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)')
+_GO_UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "μs": 1e-6, "ms": 1e-3,
+             "s": 1, "m": 60, "h": 3600}
 
 # cert-manager usages → x509 KeyUsage flags / EKU OIDs
 _KEY_USAGE_FLAGS = {
@@ -204,18 +210,18 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
 
     @staticmethod
     def _parse_duration(duration_str):
-        """Parse cert-manager duration (e.g. '87600h') to timedelta."""
-        s = duration_str.strip()
-        try:
-            if s.endswith("h"):
-                return datetime.timedelta(hours=int(s[:-1]))
-            if s.endswith("m"):
-                return datetime.timedelta(minutes=int(s[:-1]))
-            if s.endswith("s"):
-                return datetime.timedelta(seconds=int(s[:-1]))
-        except ValueError:
-            pass
-        return datetime.timedelta(hours=2160)  # 90 days default
+        """Parse a Go duration (e.g. '87600h0m0s', '1h30m', '2160h') to timedelta."""
+        default = datetime.timedelta(hours=2160)  # cert-manager default: 90 days
+        s = duration_str.strip() if isinstance(duration_str, str) else ""
+        pos, seconds = 0, 0.0
+        for m in _GO_DURATION_RE.finditer(s):
+            if m.start() != pos:
+                return default
+            seconds += float(m.group(1)) * _GO_UNITS[m.group(2)]
+            pos = m.end()
+        if not s or pos != len(s) or seconds <= 0:
+            return default
+        return datetime.timedelta(seconds=seconds)
 
     @staticmethod
     def _usage_extensions(spec, is_ca, algorithm):
@@ -243,13 +249,13 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
     def _generate_cert(self, spec, ca_key=None, ca_cert=None):
         """Generate a certificate from a cert-manager Certificate spec."""
         pk_spec = spec.get("privateKey") or {}
-        algorithm = pk_spec.get("algorithm", "RSA")
+        algorithm = pk_spec.get("algorithm") or "RSA"
         default_size = 256 if algorithm.upper() == "ECDSA" else 2048
-        key_size = pk_spec.get("size", default_size)
+        key_size = pk_spec.get("size") or default_size
 
         key = self._generate_key(algorithm, key_size)
         subject = self._build_subject(spec)
-        duration = self._parse_duration(spec.get("duration", "2160h"))
+        duration = self._parse_duration(spec.get("duration"))
         now = datetime.datetime.now(datetime.timezone.utc)
 
         builder = (x509.CertificateBuilder()
