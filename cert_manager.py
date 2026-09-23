@@ -227,12 +227,15 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
     def _usage_extensions(spec, is_ca, algorithm):
         """KeyUsage (critical) + optional ExtendedKeyUsage, cert-manager semantics.
 
-        Default usages: digital signature + key encipherment (cert-manager API docs).
+        Default usages: digital signature + key encipherment + server auth
+        (cert-manager docs: "Unless any number of usages has been set,
+        cert-manager will set the default requested usages of digital
+        signature, key encipherment, and server auth").
         CAs always get cert sign + crl sign — strict X.509 verifiers (Python >= 3.13,
         openssl -x509_strict) reject a CA without KeyUsage.
         """
         usages = [u for u in (spec.get("usages") or []) if isinstance(u, str)]
-        usages = usages or ["digital signature", "key encipherment"]
+        usages = usages or ["digital signature", "key encipherment", "server auth"]
         flags = {_KEY_USAGE_FLAGS[u] for u in usages if u in _KEY_USAGE_FLAGS}
         if is_ca:
             flags |= {"key_cert_sign", "crl_sign", "digital_signature"}
@@ -240,6 +243,8 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             flags.discard("key_encipherment")  # CBA: RSA-only semantics; revisit if cert-manager differs
         if "key_agreement" not in flags:
             flags -= {"encipher_only", "decipher_only"}
+        if not flags:
+            flags.add("digital_signature")  # RFC 5280 §4.2.1.3: KeyUsage MUST NOT be all-false
         exts = [(x509.KeyUsage(**{f: f in flags for f in _KU_FIELDS}), True)]
         ekus = [_EXT_KEY_USAGES[u] for u in usages if u in _EXT_KEY_USAGES]
         if ekus:
