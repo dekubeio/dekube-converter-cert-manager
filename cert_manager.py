@@ -227,15 +227,15 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
     def _usage_extensions(spec, is_ca, algorithm):
         """KeyUsage (critical) + optional ExtendedKeyUsage, cert-manager semantics.
 
-        Default usages: digital signature + key encipherment + server auth
-        (cert-manager docs: "Unless any number of usages has been set,
-        cert-manager will set the default requested usages of digital
-        signature, key encipherment, and server auth").
+        Default usages: digital signature + key encipherment (cert-manager
+        pkg/apis/certmanager/v1 DefaultKeyUsages, consumed by pkg/util/pki/csr.go
+        — server auth is deliberately NOT a default, since it breaks clients
+        when isCA: true).
         CAs always get cert sign + crl sign — strict X.509 verifiers (Python >= 3.13,
         openssl -x509_strict) reject a CA without KeyUsage.
         """
         usages = [u for u in (spec.get("usages") or []) if isinstance(u, str)]
-        usages = usages or ["digital signature", "key encipherment", "server auth"]
+        usages = usages or ["digital signature", "key encipherment"]
         flags = {_KEY_USAGE_FLAGS[u] for u in usages if u in _KEY_USAGE_FLAGS}
         if is_ca:
             flags |= {"key_cert_sign", "crl_sign", "digital_signature"}
