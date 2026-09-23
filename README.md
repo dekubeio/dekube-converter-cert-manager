@@ -17,9 +17,11 @@ cert-manager CRD converter for [dekube](https://dekube.io).
 
 Replaces cert-manager's certificate issuance with local generation at conversion time. Produces real PEM files (CA chains, leaf certs) that workloads pick up through the existing Secret volume-mount machinery.
 
-- Generates ECDSA or RSA private keys based on `spec.privateKey`
+- Generates ECDSA or RSA private keys based on `spec.privateKey` (null-tolerant: `algorithm: null` / `size: null` fall back to defaults)
 - Builds X.509 subjects from `spec.commonName` and `spec.subject`
 - Adds SAN entries from `spec.dnsNames`
+- Sets KeyUsage (critical) and ExtendedKeyUsage from `spec.usages`, defaulting to `digital signature` + `key encipherment` when unset (cert-manager's own `DefaultKeyUsages` — not `server auth`, despite what the cert-manager docs page implies); CAs also get `cert sign` + `crl sign`; KeyUsage is never left empty; `key encipherment` is dropped for non-RSA keys
+- Parses `duration` as a Go duration string (`87600h0m0s`, `1h30m`, `2160h`); an invalid value falls back to 90 days. `duration: null` and `isCA: null` are tolerated
 - Supports self-signed certificates (via `selfSigned` issuers) and CA-issued certificates (via `ca` issuers referencing a generated CA Secret)
 - Processes certificates in rounds: self-signed CAs first, then CA-issued leaf certs, unlocking dependent chains
 - Merges certificates that target the same `secretName` across namespaces (compose is flat -- same secretName = same file on disk, all SANs merged into one cert)
