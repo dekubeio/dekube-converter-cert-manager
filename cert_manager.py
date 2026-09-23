@@ -14,6 +14,7 @@ import sys
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
@@ -135,13 +136,22 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             if gen:
                 ca_key, ca_cert = gen["key"], gen["cert"]
 
-        key, cert = self._generate_cert(spec, ca_key, ca_cert)
+        secret_dir = os.path.join(ctx.output_dir, "secrets", secret_name)
+        out_real = os.path.realpath(ctx.output_dir) + os.sep
+        reused, reason = None, ""
+        if (os.path.realpath(secret_dir) + os.sep).startswith(out_real):
+            reused, reason = self._reusable(spec, secret_dir, ca_cert)
+        key, cert = reused or self._generate_cert(spec, ca_key, ca_cert)
         self._generated[secret_name] = {"key": key, "cert": cert}
 
         string_data = {
             "tls.crt": self._pem_cert(cert),
             "tls.key": self._pem_key(key),
         }
+        if reused:  # keep the on-disk bytes verbatim
+            for file_key in ("tls.crt", "tls.key"):
+                with open(os.path.join(secret_dir, file_key), encoding="utf-8") as f:
+                    string_data[file_key] = f.read()
         if ca_cert:
             string_data["ca.crt"] = self._pem_cert(ca_cert)
         elif spec.get("isCA"):
@@ -154,13 +164,13 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         }
 
         # Write to disk — any consumer (workload mounts, Caddy, etc.) can use it
-        secret_dir = os.path.join(ctx.output_dir, "secrets", secret_name)
         os.makedirs(secret_dir, exist_ok=True)
-        out_real = os.path.realpath(ctx.output_dir) + os.sep
         for file_key, file_val in string_data.items():
             out_path = os.path.join(secret_dir, file_key)
             if not os.path.realpath(out_path).startswith(out_real):
                 continue
+            if self._read_text(out_path) == file_val:
+                continue  # unchanged — leave the file (and its mtime) alone
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(file_val)
         ctx.generated_secrets.add(secret_name)
@@ -168,25 +178,124 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         merged = cert_m.get("_merged_from") or []
         if merged:
             all_names = [name] + merged
-            print(f"  cert-manager: generated {secret_name} "
-                  f"(merged {len(all_names)} Certificates: "
-                  f"{', '.join(all_names)})", file=sys.stderr)
+            origin = f"merged {len(all_names)} Certificates: {', '.join(all_names)}"
         else:
-            print(f"  cert-manager: generated {secret_name} "
-                  f"(Certificate/{name})", file=sys.stderr)
+            origin = f"Certificate/{name}"
+        if reused:
+            verb = "reused"
+        elif reason:
+            verb, origin = "regenerated", f"{reason} — {origin}"
+        else:
+            verb = "generated"
+        print(f"  cert-manager: {verb} {secret_name} ({origin})", file=sys.stderr)
+
+    @staticmethod
+    def _read_text(path):
+        """File contents, or None if missing/unreadable."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _reusable(self, spec, secret_dir, ca_cert):
+        """Load an existing tls.crt/tls.key pair if it still satisfies the spec.
+
+        Returns ((key, cert), "") to reuse, (None, reason) to regenerate, or
+        (None, "") when there is nothing on disk yet. ca_cert is the issuing
+        CA (None for self-signed). CAs are processed first, so a regenerated
+        CA makes its leaves fail the signature check and regenerate too.
+        """
+        crt_pem = self._read_text(os.path.join(secret_dir, "tls.crt"))
+        key_pem = self._read_text(os.path.join(secret_dir, "tls.key"))
+        if crt_pem is None or key_pem is None:
+            return None, ""
+        try:
+            cert = x509.load_pem_x509_certificate(crt_pem.encode())
+            key = serialization.load_pem_private_key(key_pem.encode(), password=None)
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            return None, f"unreadable: {exc.__class__.__name__}"
+
+        spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
+            return None, "key does not match certificate"
+
+        algorithm, key_size = self._key_params(spec)
+        if algorithm.upper() == "ECDSA":
+            if not (isinstance(key, ec.EllipticCurvePrivateKey)
+                    and key.curve.name == self._ec_curve(key_size).name):
+                return None, "key algorithm/size changed"
+        elif not (isinstance(key, rsa.RSAPrivateKey) and key.key_size == key_size):
+            return None, "key algorithm/size changed"
+
+        if cert.subject != self._build_subject(spec):
+            return None, "subject changed"
+
+        exts = {e.oid: e for e in cert.extensions}
+        san = exts.get(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        cur_dns = set(san.value.get_values_for_type(x509.DNSName)) if san else set()
+        if cur_dns != set(spec.get("dnsNames") or []):
+            return None, "SANs changed"
+
+        is_ca = bool(spec.get("isCA"))
+        bc = exts.get(x509.oid.ExtensionOID.BASIC_CONSTRAINTS)
+        if not bc or bc.value.ca != is_ca:
+            return None, "isCA changed"
+
+        want = {ext.oid: (ext, crit) for ext, crit in self._usage_extensions(spec, is_ca, algorithm)}
+        for oid in (x509.oid.ExtensionOID.KEY_USAGE, x509.oid.ExtensionOID.EXTENDED_KEY_USAGE):
+            have, (value, crit) = exts.get(oid), want.get(oid, (None, None))
+            if oid == x509.oid.ExtensionOID.EXTENDED_KEY_USAGE:  # EKU order is irrelevant
+                have_v = set(have.value) if have else None
+                value = set(value) if value else None
+            else:
+                have_v = have.value if have else None
+            if have_v != value or (have and have.critical != crit):
+                return None, "usages changed"
+
+        try:
+            cert.verify_directly_issued_by(ca_cert or cert)
+        except (ValueError, TypeError, InvalidSignature):
+            return None, "signer changed"
+
+        # cert-manager pkg/util/pki/renewaltime.go desiredRenewalTime: honour
+        # renewBefore if 0 < renewBefore < lifetime, else renewBeforePercentage
+        # in (0,100), else renew once 2/3 of the lifetime has elapsed.
+        lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
+        renew_before = self._parse_duration(spec.get("renewBefore"), default=None)
+        pct = spec.get("renewBeforePercentage")
+        if not (renew_before and renew_before < lifetime):
+            renew_before = (lifetime * pct / 100 if isinstance(pct, int) and 0 < pct < 100
+                            else lifetime / 3)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now >= cert.not_valid_after_utc - renew_before:
+            return None, "due for renewal"
+
+        return (key, cert), ""
 
     @staticmethod
     def _generate_key(algorithm="RSA", key_size=2048):
         """Generate a private key (RSA or ECDSA)."""
         if algorithm.upper() == "ECDSA":
-            if key_size <= 256:
-                curve = ec.SECP256R1()
-            elif key_size <= 384:
-                curve = ec.SECP384R1()
-            else:
-                curve = ec.SECP521R1()
-            return ec.generate_private_key(curve)
+            return ec.generate_private_key(CertManagerConverter._ec_curve(key_size))
         return rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+
+    @staticmethod
+    def _ec_curve(key_size):
+        """ECDSA curve for a cert-manager privateKey.size."""
+        if key_size <= 256:
+            return ec.SECP256R1()
+        if key_size <= 384:
+            return ec.SECP384R1()
+        return ec.SECP521R1()
+
+    @staticmethod
+    def _key_params(spec):
+        """(algorithm, key_size) from a Certificate spec's privateKey."""
+        pk_spec = spec.get("privateKey") or {}
+        algorithm = pk_spec.get("algorithm") or "RSA"
+        default_size = 256 if algorithm.upper() == "ECDSA" else 2048
+        return algorithm, pk_spec.get("size") or default_size
 
     @staticmethod
     def _build_subject(cert_spec):
@@ -209,9 +318,8 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         return x509.Name(attrs)
 
     @staticmethod
-    def _parse_duration(duration_str):
+    def _parse_duration(duration_str, default=datetime.timedelta(hours=2160)):  # cert-manager default: 90 days
         """Parse a Go duration (e.g. '87600h0m0s', '1h30m', '2160h') to timedelta."""
-        default = datetime.timedelta(hours=2160)  # cert-manager default: 90 days
         s = duration_str.strip() if isinstance(duration_str, str) else ""
         pos, seconds = 0, 0.0
         for m in _GO_DURATION_RE.finditer(s):
@@ -253,11 +361,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
 
     def _generate_cert(self, spec, ca_key=None, ca_cert=None):
         """Generate a certificate from a cert-manager Certificate spec."""
-        pk_spec = spec.get("privateKey") or {}
-        algorithm = pk_spec.get("algorithm") or "RSA"
-        default_size = 256 if algorithm.upper() == "ECDSA" else 2048
-        key_size = pk_spec.get("size") or default_size
-
+        algorithm, key_size = self._key_params(spec)
         key = self._generate_key(algorithm, key_size)
         subject = self._build_subject(spec)
         duration = self._parse_duration(spec.get("duration"))
