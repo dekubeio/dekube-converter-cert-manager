@@ -271,7 +271,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
                    .public_key(key.public_key()))
 
         # Basic constraints
-        is_ca = spec.get("isCA", False)
+        is_ca = bool(spec.get("isCA"))
         builder = builder.add_extension(
             x509.BasicConstraints(ca=is_ca, path_length=None), critical=True)
 
