@@ -29,6 +29,14 @@ Replaces cert-manager's certificate issuance with local generation at conversion
 - Injects results into `ctx.secrets` as K8s Secret format (`stringData`), making them available to downstream extensions (trust-manager, keycloak) and workload volume mounts
 - Certificates referencing ACME or missing issuers are skipped with a warning
 
+## Certificate reuse
+
+An existing certificate in `secrets/<secretName>/` is reused as long as its key material, algorithm/size, subject, SANs, `isCA`, usages, duration and issuing CA still match the spec, and it isn't yet inside its renewal window.
+
+Renewal only happens when dekube runs again — a stack that's never re-run keeps its certificate until it expires outright, and a freshly reused certificate can have as little as 1/3 of its total lifetime left under cert-manager's default renewal window (`renewBefore`/`renewBeforePercentage` unset).
+
+To force rotation, delete `secrets/<secretName>/` and re-run; to rotate an entire chain, delete the issuing CA's `secrets/<caSecretName>/` too (its leaves fail signature verification and regenerate).
+
 ## Priority
 
 `100` -- runs early. Generates secrets consumed by trust-manager (priority 200) and keycloak (priority 500).

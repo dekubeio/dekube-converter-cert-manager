@@ -181,6 +181,8 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             origin = f"Certificate/{name}"
         if reused:
             verb = "reused"
+            expires = self._not_valid_after(cert).date().isoformat()
+            origin = f"{origin}, expires {expires}"
         elif reason:
             verb, origin = "regenerated", f"{reason} — {origin}"
         else:
@@ -196,6 +198,18 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         except (OSError, UnicodeDecodeError):
             return None
 
+    @staticmethod
+    def _not_valid_before(cert):
+        """cert.not_valid_before_utc (cryptography >= 42) with a tz-naive fallback."""
+        return (getattr(cert, "not_valid_before_utc", None)
+                or cert.not_valid_before.replace(tzinfo=datetime.timezone.utc))
+
+    @staticmethod
+    def _not_valid_after(cert):
+        """cert.not_valid_after_utc (cryptography >= 42) with a tz-naive fallback."""
+        return (getattr(cert, "not_valid_after_utc", None)
+                or cert.not_valid_after.replace(tzinfo=datetime.timezone.utc))
+
     def _reusable(self, spec, secret_dir, ca_cert, out_real):  # pylint: disable=too-many-return-statements
         """Load an existing tls.crt/tls.key pair if it still satisfies the spec.
 
@@ -204,12 +218,17 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         CA (None for self-signed). CAs are processed first, so a regenerated
         CA makes its leaves fail the signature check and regenerate too.
         """
+        if not hasattr(x509.Certificate, "verify_directly_issued_by"):
+            # verify_directly_issued_by needs cryptography >= 40 (changelog: 40.0.0).
+            return None, "cryptography < 40, certificate reuse disabled"
         paths = [os.path.join(secret_dir, f) for f in ("tls.crt", "tls.key")]
         if not all(os.path.realpath(p).startswith(out_real) for p in paths):
             return None, "existing files point outside the output dir"
         crt_pem, key_pem = (self._read_text(p) for p in paths)
+        if crt_pem is None and key_pem is None:
+            return None, ""  # nothing on disk yet
         if crt_pem is None or key_pem is None:
-            return None, ""
+            return None, "tls.crt/tls.key incomplete on disk"
         # Any failure below (bad PEM, lazily-parsed extensions raising
         # DuplicateExtension, odd key types…) means "regenerate", never a crash.
         try:
@@ -260,7 +279,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
 
             # cert-manager reissues on a spec.duration change (pkg/util/pki/match.go
             # RequestMatchesSpec, "spec.duration" violation); 1s absorbs rounding.
-            lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
+            lifetime = self._not_valid_after(cert) - self._not_valid_before(cert)
             if abs(lifetime - self._parse_duration(spec.get("duration"))) > datetime.timedelta(seconds=1):
                 return None, "duration changed"
 
@@ -273,7 +292,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
                 renew_before = (lifetime * pct / 100 if isinstance(pct, int) and 0 < pct < 100
                                 else lifetime / 3)
             now = datetime.datetime.now(datetime.timezone.utc)
-            if now >= cert.not_valid_after_utc - renew_before:
+            if now >= self._not_valid_after(cert) - renew_before:
                 return None, "due for renewal"
         except Exception as exc:  # pylint: disable=broad-exception-caught  # unreadable → regenerate
             return None, f"unreadable: {exc.__class__.__name__}"
