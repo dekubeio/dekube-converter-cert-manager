@@ -14,7 +14,7 @@ import sys
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
@@ -138,9 +138,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
 
         secret_dir = os.path.join(ctx.output_dir, "secrets", secret_name)
         out_real = os.path.realpath(ctx.output_dir) + os.sep
-        reused, reason = None, ""
-        if (os.path.realpath(secret_dir) + os.sep).startswith(out_real):
-            reused, reason = self._reusable(spec, secret_dir, ca_cert)
+        reused, reason = self._reusable(spec, secret_dir, ca_cert, out_real)
         key, cert = reused or self._generate_cert(spec, ca_key, ca_cert)
         self._generated[secret_name] = {"key": key, "cert": cert}
 
@@ -198,7 +196,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         except (OSError, UnicodeDecodeError):
             return None
 
-    def _reusable(self, spec, secret_dir, ca_cert):
+    def _reusable(self, spec, secret_dir, ca_cert, out_real):  # pylint: disable=too-many-return-statements
         """Load an existing tls.crt/tls.key pair if it still satisfies the spec.
 
         Returns ((key, cert), "") to reuse, (None, reason) to regenerate, or
@@ -206,70 +204,79 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         CA (None for self-signed). CAs are processed first, so a regenerated
         CA makes its leaves fail the signature check and regenerate too.
         """
-        crt_pem = self._read_text(os.path.join(secret_dir, "tls.crt"))
-        key_pem = self._read_text(os.path.join(secret_dir, "tls.key"))
+        paths = [os.path.join(secret_dir, f) for f in ("tls.crt", "tls.key")]
+        if not all(os.path.realpath(p).startswith(out_real) for p in paths):
+            return None, "existing files point outside the output dir"
+        crt_pem, key_pem = (self._read_text(p) for p in paths)
         if crt_pem is None or key_pem is None:
             return None, ""
+        # Any failure below (bad PEM, lazily-parsed extensions raising
+        # DuplicateExtension, odd key types…) means "regenerate", never a crash.
         try:
             cert = x509.load_pem_x509_certificate(crt_pem.encode())
             key = serialization.load_pem_private_key(key_pem.encode(), password=None)
-        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
-            return None, f"unreadable: {exc.__class__.__name__}"
 
-        spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-        if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
-            return None, "key does not match certificate"
+            spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+            if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
+                return None, "key does not match certificate"
 
-        algorithm, key_size = self._key_params(spec)
-        if algorithm.upper() == "ECDSA":
-            if not (isinstance(key, ec.EllipticCurvePrivateKey)
-                    and key.curve.name == self._ec_curve(key_size).name):
+            algorithm, key_size = self._key_params(spec)
+            if algorithm.upper() == "ECDSA":
+                if not (isinstance(key, ec.EllipticCurvePrivateKey)
+                        and key.curve.name == self._ec_curve(key_size).name):
+                    return None, "key algorithm/size changed"
+            elif not (isinstance(key, rsa.RSAPrivateKey) and key.key_size == key_size):
                 return None, "key algorithm/size changed"
-        elif not (isinstance(key, rsa.RSAPrivateKey) and key.key_size == key_size):
-            return None, "key algorithm/size changed"
 
-        if cert.subject != self._build_subject(spec):
-            return None, "subject changed"
+            if cert.subject != self._build_subject(spec):
+                return None, "subject changed"
 
-        exts = {e.oid: e for e in cert.extensions}
-        san = exts.get(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-        cur_dns = set(san.value.get_values_for_type(x509.DNSName)) if san else set()
-        if cur_dns != set(spec.get("dnsNames") or []):
-            return None, "SANs changed"
+            exts = {e.oid: e for e in cert.extensions}
+            san = exts.get(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+            cur_dns = set(san.value.get_values_for_type(x509.DNSName)) if san else set()
+            if cur_dns != set(spec.get("dnsNames") or []):
+                return None, "SANs changed"
 
-        is_ca = bool(spec.get("isCA"))
-        bc = exts.get(x509.oid.ExtensionOID.BASIC_CONSTRAINTS)
-        if not bc or bc.value.ca != is_ca:
-            return None, "isCA changed"
+            is_ca = bool(spec.get("isCA"))
+            bc = exts.get(x509.oid.ExtensionOID.BASIC_CONSTRAINTS)
+            if not bc or bc.value.ca != is_ca:
+                return None, "isCA changed"
 
-        want = {ext.oid: (ext, crit) for ext, crit in self._usage_extensions(spec, is_ca, algorithm)}
-        for oid in (x509.oid.ExtensionOID.KEY_USAGE, x509.oid.ExtensionOID.EXTENDED_KEY_USAGE):
-            have, (value, crit) = exts.get(oid), want.get(oid, (None, None))
-            if oid == x509.oid.ExtensionOID.EXTENDED_KEY_USAGE:  # EKU order is irrelevant
-                have_v = set(have.value) if have else None
-                value = set(value) if value else None
-            else:
-                have_v = have.value if have else None
-            if have_v != value or (have and have.critical != crit):
-                return None, "usages changed"
+            want = {ext.oid: (ext, crit) for ext, crit in self._usage_extensions(spec, is_ca, algorithm)}
+            for oid in (x509.oid.ExtensionOID.KEY_USAGE, x509.oid.ExtensionOID.EXTENDED_KEY_USAGE):
+                have, (value, crit) = exts.get(oid), want.get(oid, (None, None))
+                if oid == x509.oid.ExtensionOID.EXTENDED_KEY_USAGE:  # EKU order is irrelevant
+                    have_v = set(have.value) if have else None
+                    value = set(value) if value else None
+                else:
+                    have_v = have.value if have else None
+                if have_v != value or (have and have.critical != crit):
+                    return None, "usages changed"
 
-        try:
-            cert.verify_directly_issued_by(ca_cert or cert)
-        except (ValueError, TypeError, InvalidSignature):
-            return None, "signer changed"
+            try:
+                cert.verify_directly_issued_by(ca_cert or cert)
+            except (ValueError, TypeError, InvalidSignature):
+                return None, "signer changed"
 
-        # cert-manager pkg/util/pki/renewaltime.go desiredRenewalTime: honour
-        # renewBefore if 0 < renewBefore < lifetime, else renewBeforePercentage
-        # in (0,100), else renew once 2/3 of the lifetime has elapsed.
-        lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
-        renew_before = self._parse_duration(spec.get("renewBefore"), default=None)
-        pct = spec.get("renewBeforePercentage")
-        if not (renew_before and renew_before < lifetime):
-            renew_before = (lifetime * pct / 100 if isinstance(pct, int) and 0 < pct < 100
-                            else lifetime / 3)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if now >= cert.not_valid_after_utc - renew_before:
-            return None, "due for renewal"
+            # cert-manager reissues on a spec.duration change (pkg/util/pki/match.go
+            # RequestMatchesSpec, "spec.duration" violation); 1s absorbs rounding.
+            lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
+            if abs(lifetime - self._parse_duration(spec.get("duration"))) > datetime.timedelta(seconds=1):
+                return None, "duration changed"
+
+            # cert-manager pkg/util/pki/renewaltime.go desiredRenewalTime: honour
+            # renewBefore if 0 < renewBefore < lifetime, else renewBeforePercentage
+            # in (0,100), else renew once 2/3 of the lifetime has elapsed.
+            renew_before = self._parse_duration(spec.get("renewBefore"), default=None)
+            pct = spec.get("renewBeforePercentage")
+            if not (renew_before and renew_before < lifetime):
+                renew_before = (lifetime * pct / 100 if isinstance(pct, int) and 0 < pct < 100
+                                else lifetime / 3)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if now >= cert.not_valid_after_utc - renew_before:
+                return None, "due for renewal"
+        except Exception as exc:  # pylint: disable=broad-exception-caught  # unreadable → regenerate
+            return None, f"unreadable: {exc.__class__.__name__}"
 
         return (key, cert), ""
 
