@@ -12,11 +12,29 @@ import os
 import sys
 
 from cryptography import x509
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from dekube import ConverterResult, Converter  # pylint: disable=import-error  # h2c resolves at runtime
+
+
+# cert-manager usages → x509 KeyUsage flags / EKU OIDs
+_KEY_USAGE_FLAGS = {
+    "digital signature": "digital_signature", "signing": "digital_signature",
+    "content commitment": "content_commitment", "key encipherment": "key_encipherment",
+    "key agreement": "key_agreement", "data encipherment": "data_encipherment",
+    "cert sign": "key_cert_sign", "crl sign": "crl_sign",
+    "encipher only": "encipher_only", "decipher only": "decipher_only",
+}
+_EXT_KEY_USAGES = {
+    "server auth": ExtendedKeyUsageOID.SERVER_AUTH, "client auth": ExtendedKeyUsageOID.CLIENT_AUTH,
+    "code signing": ExtendedKeyUsageOID.CODE_SIGNING,
+    "email protection": ExtendedKeyUsageOID.EMAIL_PROTECTION,
+    "timestamping": ExtendedKeyUsageOID.TIME_STAMPING, "ocsp signing": ExtendedKeyUsageOID.OCSP_SIGNING,
+}
+_KU_FIELDS = ("digital_signature", "content_commitment", "key_encipherment", "data_encipherment",
+              "key_agreement", "key_cert_sign", "crl_sign", "encipher_only", "decipher_only")
 
 
 # ---- converter class -------------------------------------------------------
@@ -199,6 +217,29 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             pass
         return datetime.timedelta(hours=2160)  # 90 days default
 
+    @staticmethod
+    def _usage_extensions(spec, is_ca, algorithm):
+        """KeyUsage (critical) + optional ExtendedKeyUsage, cert-manager semantics.
+
+        Default usages: digital signature + key encipherment (cert-manager API docs).
+        CAs always get cert sign + crl sign — strict X.509 verifiers (Python >= 3.13,
+        openssl -x509_strict) reject a CA without KeyUsage.
+        """
+        usages = [u for u in (spec.get("usages") or []) if isinstance(u, str)]
+        usages = usages or ["digital signature", "key encipherment"]
+        flags = {_KEY_USAGE_FLAGS[u] for u in usages if u in _KEY_USAGE_FLAGS}
+        if is_ca:
+            flags |= {"key_cert_sign", "crl_sign", "digital_signature"}
+        if algorithm.upper() != "RSA":
+            flags.discard("key_encipherment")  # CBA: RSA-only semantics; revisit if cert-manager differs
+        if "key_agreement" not in flags:
+            flags -= {"encipher_only", "decipher_only"}
+        exts = [(x509.KeyUsage(**{f: f in flags for f in _KU_FIELDS}), True)]
+        ekus = [_EXT_KEY_USAGES[u] for u in usages if u in _EXT_KEY_USAGES]
+        if ekus:
+            exts.append((x509.ExtendedKeyUsage(ekus), False))
+        return exts
+
     def _generate_cert(self, spec, ca_key=None, ca_cert=None):
         """Generate a certificate from a cert-manager Certificate spec."""
         pk_spec = spec.get("privateKey") or {}
@@ -222,6 +263,10 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         is_ca = spec.get("isCA", False)
         builder = builder.add_extension(
             x509.BasicConstraints(ca=is_ca, path_length=None), critical=True)
+
+        # KeyUsage / ExtendedKeyUsage — strict X.509 verifiers reject a cert without these
+        for ext, critical in self._usage_extensions(spec, is_ca, algorithm):
+            builder = builder.add_extension(ext, critical=critical)
 
         # Subject Key Identifier
         builder = builder.add_extension(
