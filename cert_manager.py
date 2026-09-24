@@ -195,6 +195,15 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         for file_key, file_val in string_data.items():
             out_path = os.path.join(secret_dir, file_key)
             if not os.path.realpath(out_path).startswith(out_real):
+                # e.g. a symlink escaping secret_dir: writing through it could
+                # clobber an arbitrary file, so refuse — but that leaves this
+                # file stale against the (possibly regenerated) sibling, so
+                # warn loudly instead of skipping silently.
+                msg = (f"cert-manager: refused to write {out_path} "
+                       f"(escapes output dir, likely a symlink) — "
+                       f"{secret_name} may now have a mismatched cert/key pair on disk")
+                ctx.warnings.append(msg)
+                print(f"  {msg}", file=sys.stderr)
                 continue
             if self._read_text(out_path) == file_val:
                 continue  # unchanged — leave the file (and its mtime) alone
