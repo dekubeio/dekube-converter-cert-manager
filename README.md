@@ -19,7 +19,7 @@ Replaces cert-manager's certificate issuance with local generation at conversion
 
 - Generates ECDSA or RSA private keys based on `spec.privateKey` (null-tolerant: `algorithm: null` / `size: null` fall back to defaults)
 - Builds X.509 subjects from `spec.commonName` and `spec.subject`
-- Adds SAN entries from `spec.dnsNames`
+- Adds SAN entries from `spec.dnsNames`, `spec.ipAddresses`, `spec.uris`, and `spec.emailAddresses`
 - Sets KeyUsage (critical) and ExtendedKeyUsage from `spec.usages`, defaulting to `digital signature` + `key encipherment` when unset (cert-manager's own `DefaultKeyUsages` — not `server auth`, despite what the cert-manager docs page implies); CAs also get `cert sign` + `crl sign`; KeyUsage is never left empty; `key encipherment` is dropped for non-RSA keys
 - Parses `duration` as a Go duration string (`87600h0m0s`, `1h30m`, `2160h`); an invalid value falls back to 90 days. `duration: null` and `isCA: null` are tolerated
 - Supports self-signed certificates (via `selfSigned` issuers) and CA-issued certificates (via `ca` issuers referencing a generated CA Secret)
