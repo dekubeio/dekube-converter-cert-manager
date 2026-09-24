@@ -71,16 +71,16 @@ python3 helmfile2compose.py --extensions-dir ./dekube-converter-cert-manager --h
 
 ## Code quality
 
-*Last updated: 2026-02-23*
+*Last updated: 2026-09-24 — re-measured after splitting `_reusable` (was F/43, accumulated across several SAN/issuer-lookup fix commits) into `_check_key_subject_sans` / `_check_is_ca_and_usages` / `_check_signer_and_expiry`, all C-or-better, byte-identical output. The MI/avg-CC numbers below are lower than the previous entry on this page (47.61/4.0) — that entry predates the fix commits that grew `_reusable`; it was stale, not a regression from this refactor.*
 
 | Metric | Value |
 |--------|-------|
-| Pylint | 9.88/10 |
+| Pylint | 9.76/10 |
 | Pyflakes | clean |
-| Radon MI | 47.61 (A) |
-| Radon avg CC | 4.0 (A) |
+| Radon MI | 17.92 (B) |
+| Radon avg CC | 6.9 (B) |
 
-No C-rated functions.
+Worst CC: `_generate_one` (20, C), `_usage_extensions` (15, C), `_check_key_subject_sans` (14, C), `_reusable` (14, C), `_check_is_ca_and_usages` (13, C), `_build_subject` (12, C), `_merge_by_secret` (11, C). No function rated D or worse.
 
 The `E0401: Unable to import 'dekube'` is expected — extensions import from dekube-engine at runtime, not at lint time.
 

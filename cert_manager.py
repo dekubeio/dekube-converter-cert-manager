@@ -272,75 +272,97 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         try:
             cert = x509.load_pem_x509_certificate(crt_pem.encode())
             key = serialization.load_pem_private_key(key_pem.encode(), password=None)
-
-            spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-            if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
-                return None, "key does not match certificate"
-
-            algorithm, key_size = self._key_params(spec)
-            if algorithm.upper() == "ECDSA":
-                if not (isinstance(key, ec.EllipticCurvePrivateKey)
-                        and key.curve.name == self._ec_curve(key_size).name):
-                    return None, "key algorithm/size changed"
-            elif not (isinstance(key, rsa.RSAPrivateKey) and key.key_size == key_size):
-                return None, "key algorithm/size changed"
-
-            if cert.subject != self._build_subject(spec):
-                return None, "subject changed"
-
-            exts = {e.oid: e for e in cert.extensions}
-            san = exts.get(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-            cur_sans = (
-                set(san.value.get_values_for_type(x509.DNSName)) if san else set(),
-                set(san.value.get_values_for_type(x509.IPAddress)) if san else set(),
-                set(san.value.get_values_for_type(x509.UniformResourceIdentifier)) if san else set(),
-                set(san.value.get_values_for_type(x509.RFC822Name)) if san else set(),
-            )
-            if cur_sans != self._spec_sans(spec):
-                return None, "SANs changed"
-
-            is_ca = bool(spec.get("isCA"))
-            bc = exts.get(x509.oid.ExtensionOID.BASIC_CONSTRAINTS)
-            if not bc or bc.value.ca != is_ca:
-                return None, "isCA changed"
-
-            want = {ext.oid: (ext, crit) for ext, crit in self._usage_extensions(spec, is_ca, algorithm)}
-            for oid in (x509.oid.ExtensionOID.KEY_USAGE, x509.oid.ExtensionOID.EXTENDED_KEY_USAGE):
-                have, (value, crit) = exts.get(oid), want.get(oid, (None, None))
-                if oid == x509.oid.ExtensionOID.EXTENDED_KEY_USAGE:  # EKU order is irrelevant
-                    have_v = set(have.value) if have else None
-                    value = set(value) if value else None
-                else:
-                    have_v = have.value if have else None
-                if have_v != value or (have and have.critical != crit):
-                    return None, "usages changed"
-
-            try:
-                cert.verify_directly_issued_by(ca_cert or cert)
-            except (ValueError, TypeError, InvalidSignature):
-                return None, "signer changed"
-
-            # cert-manager reissues on a spec.duration change (pkg/util/pki/match.go
-            # RequestMatchesSpec, "spec.duration" violation); 1s absorbs rounding.
-            lifetime = self._not_valid_after(cert) - self._not_valid_before(cert)
-            if abs(lifetime - self._parse_duration(spec.get("duration"))) > datetime.timedelta(seconds=1):
-                return None, "duration changed"
-
-            # cert-manager pkg/util/pki/renewaltime.go desiredRenewalTime: honour
-            # renewBefore if 0 < renewBefore < lifetime, else renewBeforePercentage
-            # in (0,100), else renew once 2/3 of the lifetime has elapsed.
-            renew_before = self._parse_duration(spec.get("renewBefore"), default=None)
-            pct = spec.get("renewBeforePercentage")
-            if not (renew_before and renew_before < lifetime):
-                renew_before = (lifetime * pct / 100 if isinstance(pct, int) and 0 < pct < 100
-                                else lifetime / 3)
-            now = datetime.datetime.now(datetime.timezone.utc)
-            if now >= self._not_valid_after(cert) - renew_before:
-                return None, "due for renewal"
+            algorithm, _ = self._key_params(spec)
+            # First reason wins, in the same order as the original checks:
+            # key/subject/SANs, isCA/usages, signer/duration/renewal.
+            reason = (self._check_key_subject_sans(spec, key, cert)
+                      or self._check_is_ca_and_usages(spec, cert, algorithm)
+                      or self._check_signer_and_expiry(spec, cert, ca_cert))
+            if reason:
+                return None, reason
         except Exception as exc:  # pylint: disable=broad-exception-caught  # unreadable → regenerate
             return None, f"unreadable: {exc.__class__.__name__}"
 
         return (key, cert), ""
+
+    @staticmethod
+    def _check_key_subject_sans(spec, key, cert):
+        """Reject a key/cert no longer matching spec's key params, subject or SANs."""
+        spki = (serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
+            return "key does not match certificate"
+        algorithm, key_size = CertManagerConverter._key_params(spec)
+        if algorithm.upper() == "ECDSA":
+            if not (isinstance(key, ec.EllipticCurvePrivateKey)
+                    and key.curve.name == CertManagerConverter._ec_curve(key_size).name):
+                return "key algorithm/size changed"
+        elif not (isinstance(key, rsa.RSAPrivateKey) and key.key_size == key_size):
+            return "key algorithm/size changed"
+
+        if cert.subject != CertManagerConverter._build_subject(spec):
+            return "subject changed"
+
+        exts = {e.oid: e for e in cert.extensions}
+        san = exts.get(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+        cur_sans = (
+            set(san.value.get_values_for_type(x509.DNSName)) if san else set(),
+            set(san.value.get_values_for_type(x509.IPAddress)) if san else set(),
+            set(san.value.get_values_for_type(x509.UniformResourceIdentifier)) if san else set(),
+            set(san.value.get_values_for_type(x509.RFC822Name)) if san else set(),
+        )
+        if cur_sans != CertManagerConverter._spec_sans(spec):
+            return "SANs changed"
+        return None
+
+    @staticmethod
+    def _check_is_ca_and_usages(spec, cert, algorithm):
+        """Reject a cert whose BasicConstraints.ca or Key/ExtendedKeyUsage no longer match spec."""
+        is_ca = bool(spec.get("isCA"))
+        exts = {e.oid: e for e in cert.extensions}
+        bc = exts.get(x509.oid.ExtensionOID.BASIC_CONSTRAINTS)
+        if not bc or bc.value.ca != is_ca:
+            return "isCA changed"
+        want = {ext.oid: (ext, crit) for ext, crit in
+                CertManagerConverter._usage_extensions(spec, is_ca, algorithm)}
+        for oid in (x509.oid.ExtensionOID.KEY_USAGE, x509.oid.ExtensionOID.EXTENDED_KEY_USAGE):
+            have, (value, crit) = exts.get(oid), want.get(oid, (None, None))
+            if oid == x509.oid.ExtensionOID.EXTENDED_KEY_USAGE:  # EKU order is irrelevant
+                have_v = set(have.value) if have else None
+                value = set(value) if value else None
+            else:
+                have_v = have.value if have else None
+            if have_v != value or (have and have.critical != crit):
+                return "usages changed"
+        return None
+
+    @staticmethod
+    def _check_signer_and_expiry(spec, cert, ca_cert):
+        """Reject a cert no longer signed by ca_cert, or past its duration/renewal threshold.
+
+        Self-signed when ca_cert is None. cert-manager reissues on a spec.duration
+        change (pkg/util/pki/match.go RequestMatchesSpec, "spec.duration" violation);
+        1s absorbs rounding. pkg/util/pki/renewaltime.go desiredRenewalTime: honour
+        renewBefore if 0 < renewBefore < lifetime, else renewBeforePercentage in
+        (0,100), else renew once 2/3 of the lifetime has elapsed.
+        """
+        try:
+            cert.verify_directly_issued_by(ca_cert or cert)
+        except (ValueError, TypeError, InvalidSignature):
+            return "signer changed"
+
+        lifetime = CertManagerConverter._not_valid_after(cert) - CertManagerConverter._not_valid_before(cert)
+        if abs(lifetime - CertManagerConverter._parse_duration(spec.get("duration"))) \
+                > datetime.timedelta(seconds=1):
+            return "duration changed"
+        renew_before = CertManagerConverter._parse_duration(spec.get("renewBefore"), default=None)
+        pct = spec.get("renewBeforePercentage")
+        if not (renew_before and renew_before < lifetime):
+            renew_before = (lifetime * pct / 100 if isinstance(pct, int) and 0 < pct < 100
+                            else lifetime / 3)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now >= CertManagerConverter._not_valid_after(cert) - renew_before:
+            return "due for renewal"
+        return None
 
     @staticmethod
     def _generate_key(algorithm="RSA", key_size=2048):
