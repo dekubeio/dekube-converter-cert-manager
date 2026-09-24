@@ -8,6 +8,7 @@ Requires: cryptography
 """
 
 import datetime
+import ipaddress
 import os
 import re
 import sys
@@ -110,10 +111,12 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
                 by_secret[secret_name] = cert_m
             else:
                 existing = by_secret[secret_name]
-                existing_dns = set((existing.get("spec") or {}).get("dnsNames") or [])
-                new_dns = (cert_m.get("spec") or {}).get("dnsNames") or []
-                existing_dns.update(new_dns)
-                existing["spec"]["dnsNames"] = sorted(existing_dns)
+                existing_spec = existing.get("spec") or {}
+                new_spec = cert_m.get("spec") or {}
+                for field in CertManagerConverter._SAN_FIELDS:
+                    merged = set(existing_spec.get(field) or []) | set(new_spec.get(field) or [])
+                    if merged:
+                        existing_spec[field] = sorted(merged)
                 existing.setdefault("_merged_from", []).append(
                     (cert_m.get("metadata") or {}).get("name", "?"))
         return by_secret.values()
@@ -252,8 +255,13 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
 
             exts = {e.oid: e for e in cert.extensions}
             san = exts.get(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-            cur_dns = set(san.value.get_values_for_type(x509.DNSName)) if san else set()
-            if cur_dns != set(spec.get("dnsNames") or []):
+            cur_sans = (
+                set(san.value.get_values_for_type(x509.DNSName)) if san else set(),
+                set(san.value.get_values_for_type(x509.IPAddress)) if san else set(),
+                set(san.value.get_values_for_type(x509.UniformResourceIdentifier)) if san else set(),
+                set(san.value.get_values_for_type(x509.RFC822Name)) if san else set(),
+            )
+            if cur_sans != self._spec_sans(spec):
                 return None, "SANs changed"
 
             is_ca = bool(spec.get("isCA"))
@@ -385,6 +393,46 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             exts.append((x509.ExtendedKeyUsage(ekus), False))
         return exts
 
+    @staticmethod
+    def _parse_ips(ip_strs):
+        """spec.ipAddresses strings → set of ipaddress objects.
+
+        cert-manager's admission webhook already rejects invalid IP literals
+        before the Certificate can exist in-cluster, so an unparseable entry
+        here is dropped rather than crashing the conversion.
+        """
+        parsed = set()
+        for ip in ip_strs or []:
+            try:
+                parsed.add(ipaddress.ip_address(ip))
+            except ValueError:
+                continue
+        return parsed
+
+    @staticmethod
+    def _spec_sans(spec):
+        """SAN fields from a Certificate spec as (dns, ip, uri, email) sets.
+
+        cert-manager v1 CertificateSpec: dnsNames, ipAddresses, uris,
+        emailAddresses (pkg/apis/certmanager/v1/types_certificate.go).
+        """
+        return (
+            set(spec.get("dnsNames") or []),
+            CertManagerConverter._parse_ips(spec.get("ipAddresses")),
+            set(spec.get("uris") or []),
+            set(spec.get("emailAddresses") or []),
+        )
+
+    @staticmethod
+    def _san_general_names(spec):
+        """x509 GeneralName list for the SAN extension, built from _spec_sans."""
+        dns, ips, uris, emails = CertManagerConverter._spec_sans(spec)
+        names = [x509.DNSName(n) for n in sorted(dns)]
+        names += [x509.IPAddress(ip) for ip in sorted(ips, key=str)]
+        names += [x509.UniformResourceIdentifier(u) for u in sorted(uris)]
+        names += [x509.RFC822Name(e) for e in sorted(emails)]
+        return names
+
     def _generate_cert(self, spec, ca_key=None, ca_cert=None):
         """Generate a certificate from a cert-manager Certificate spec."""
         algorithm, key_size = self._key_params(spec)
@@ -414,11 +462,11 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
             x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
             critical=False)
 
-        # SAN — dnsNames
-        dns_names = spec.get("dnsNames") or []
-        if dns_names:
+        # SAN — dnsNames, ipAddresses, uris, emailAddresses
+        san_names = self._san_general_names(spec)
+        if san_names:
             builder = builder.add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(n) for n in dns_names]),
+                x509.SubjectAlternativeName(san_names),
                 critical=False)
 
         # Issuer
