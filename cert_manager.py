@@ -59,22 +59,44 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
     priority = 100  # runs first: generates secrets consumed by trust-manager & keycloak
 
     def __init__(self):
-        self._issuers = {}     # name → issuer spec dict
+        self._issuers = {}     # (kind, namespace-or-None, name) → issuer spec dict
         self._generated = {}   # secret_name → {"key": key_obj, "cert": cert_obj}
 
     def convert(self, kind, manifests, ctx):
         """Dispatch to issuer indexer or certificate processor."""
         if kind in ("ClusterIssuer", "Issuer"):
-            self._index_issuers(manifests)
+            self._index_issuers(kind, manifests)
             return ConverterResult()
         # kind == "Certificate"
         return self._process_certificates(manifests, ctx)
 
-    def _index_issuers(self, manifests):
+    def _index_issuers(self, kind, manifests):
         for m in manifests:
             name = (m.get("metadata") or {}).get("name", "")
-            if name:
-                self._issuers[name] = m.get("spec") or {}
+            if not name:
+                continue
+            # ClusterIssuer is cluster-scoped (no namespace); Issuer is namespaced
+            # and only resolvable by a Certificate in the same namespace.
+            if kind == "Issuer":
+                namespace = (m.get("metadata") or {}).get("namespace") or "default"
+            else:
+                namespace = None
+            self._issuers[(kind, namespace, name)] = m.get("spec") or {}
+
+    @staticmethod
+    def _issuer_key(cert_m):
+        """(kind, namespace, name) key for a Certificate's issuerRef, matching
+        _index_issuers. cert-manager semantics (pkg/apis/meta/v1.IssuerReference):
+        issuerRef.kind defaults to 'Issuer' (namespaced, resolved in the
+        Certificate's own namespace), issuerRef.group defaults to 'cert-manager.io'.
+        """
+        issuer_ref = ((cert_m.get("spec") or {}).get("issuerRef")) or {}
+        name = issuer_ref.get("name", "")
+        kind = issuer_ref.get("kind") or "Issuer"
+        if kind == "ClusterIssuer":
+            return (kind, None, name)
+        namespace = (cert_m.get("metadata") or {}).get("namespace") or "default"
+        return (kind, namespace, name)
 
     def _process_certificates(self, manifests, ctx):
         # Process in rounds: each round generates certs whose issuer CA is
@@ -90,16 +112,21 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
 
         for cert_m in pending:
             name = (cert_m.get("metadata") or {}).get("name", "?")
-            issuer = ((cert_m.get("spec") or {}).get("issuerRef") or {}).get("name", "?")
+            issuer_ref = (cert_m.get("spec") or {}).get("issuerRef") or {}
+            issuer = issuer_ref.get("name", "?")
+            issuer_kind = issuer_ref.get("kind") or "Issuer"
             ctx.warnings.append(
                 f"Certificate '{name}' references unresolvable issuer "
-                f"'{issuer}' (ACME or missing) — skipped")
+                f"{issuer_kind}/'{issuer}' (ACME or missing) — skipped")
 
         return ConverterResult()
 
+    # cert-manager v1 CertificateSpec SAN list fields (types_certificate.go)
+    _SAN_FIELDS = ("dnsNames", "ipAddresses", "uris", "emailAddresses")
+
     @staticmethod
     def _merge_by_secret(batch):
-        """Group certificates by secretName, merge dnsNames for duplicates.
+        """Group certificates by secretName, merge SANs for duplicates.
 
         In K8s, each namespace has its own Secret. In compose (flat), same
         secretName = same file on disk. Merge all SANs into one cert.
@@ -129,8 +156,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         if not secret_name:
             return
 
-        issuer_name = (spec.get("issuerRef") or {}).get("name", "")
-        issuer_spec = self._issuers.get(issuer_name) or {}
+        issuer_spec = self._issuers.get(self._issuer_key(cert_m)) or {}
 
         ca_key, ca_cert = None, None
         if "ca" in issuer_spec:
@@ -503,9 +529,7 @@ class CertManagerConverter(Converter):  # pylint: disable=too-few-public-methods
         ready = []
         pending = []
         for cert_m in certs:
-            issuer_name = ((cert_m.get("spec") or {}).get(
-                "issuerRef") or {}).get("name", "")
-            issuer_spec = self._issuers.get(issuer_name)
+            issuer_spec = self._issuers.get(self._issuer_key(cert_m))
 
             if issuer_spec is None:
                 pending.append(cert_m)
